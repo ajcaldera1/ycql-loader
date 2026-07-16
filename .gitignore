@@ -1,0 +1,7 @@
+# Compiled binary
+/ycql-loader
+
+# Go build/test artifacts
+*.exe
+*.test
+*.out
