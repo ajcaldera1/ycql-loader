@@ -15,14 +15,20 @@ import (
 // Schema DDL
 // ---------------------------------------------------------------------------
 
-var setupCQL = []string{
-	`CREATE TYPE IF NOT EXISTS attribute_source (
-		priority          int,
-		product_source_id bigint,
-		source_id         bigint,
-		source_type       text
-	)`,
-	`CREATE TABLE IF NOT EXISTS retailer_products (
+const createTypeCQL = `CREATE TYPE IF NOT EXISTS attribute_source (
+	priority          int,
+	product_source_id bigint,
+	source_id         bigint,
+	source_type       text
+)`
+
+const dropTableCQL = `DROP TABLE IF EXISTS retailer_products`
+
+// createTableCQL builds the retailer_products DDL, presplitting into the given
+// number of tablets. A tablet count <= 0 omits the WITH tablets clause and lets
+// the cluster choose the default.
+func createTableCQL(tablets int) string {
+	base := `CREATE TABLE IF NOT EXISTS retailer_products (
 		retailer_id              int,
 		product_id               bigint,
 		surface_id               int,
@@ -34,7 +40,11 @@ var setupCQL = []string{
 		updated_at               timestamp,
 		generated_at             timestamp,
 		PRIMARY KEY ((retailer_id, product_id), surface_id, locale_id, catalog_build_variant_id)
-	) WITH tablets=4`,
+	)`
+	if tablets > 0 {
+		return fmt.Sprintf("%s WITH tablets=%d", base, tablets)
+	}
+	return base
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +63,10 @@ func main() {
 	flag.IntVar(&cfg.Writers, "writers", 32, "Number of writer goroutines")
 	flag.IntVar(&cfg.Generators, "generators", 4, "Number of generator goroutines")
 	flag.IntVar(&cfg.RF, "rf", 1, "Replication factor for keyspace creation")
+	flag.IntVar(&cfg.Tablets, "tablets", 4,
+		"Number of tablets to presplit retailer_products into when creating it (<=0 = cluster default)")
+	flag.BoolVar(&cfg.DropExisting, "drop-existing", false,
+		"Drop the retailer_products table if it already exists before creating it")
 	flag.DurationVar(&cfg.ResyncInterval, "resync-interval", 0,
 		"How often to re-query system.partitions and realign writers to new tablet boundaries (e.g. 30s; 0 = disabled)")
 	flag.Parse()
@@ -69,7 +83,7 @@ func main() {
 	session := newSession(hosts, cfg, cfg.Keyspace)
 	defer session.Close()
 
-	createTables(session)
+	createTables(session, cfg)
 
 	// Phase 3: discover tablets so we can route batches to the writer that
 	// owns each tablet.
@@ -178,14 +192,27 @@ func createKeyspace(session *gocql.Session, cfg Config) {
 	fmt.Printf("Using keyspace: %s\n", cfg.Keyspace)
 }
 
-func createTables(session *gocql.Session) {
-	for _, stmt := range setupCQL {
+func createTables(session *gocql.Session, cfg Config) {
+	if cfg.DropExisting {
+		if err := session.Query(dropTableCQL).Exec(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to drop retailer_products: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Dropped existing retailer_products table.")
+	}
+
+	stmts := []string{createTypeCQL, createTableCQL(cfg.Tablets)}
+	for _, stmt := range stmts {
 		if err := session.Query(stmt).Exec(); err != nil {
 			fmt.Fprintf(os.Stderr, "Schema error: %v\n", err)
 			os.Exit(1)
 		}
 	}
-	fmt.Println("Schema ready (type + table).")
+	if cfg.Tablets > 0 {
+		fmt.Printf("Schema ready (type + table, presplit into %d tablets).\n", cfg.Tablets)
+	} else {
+		fmt.Println("Schema ready (type + table, cluster-default tablets).")
+	}
 }
 
 // printTabletRanges prints each tablet's hash range, collapsing the list to a

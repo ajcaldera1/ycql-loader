@@ -71,5 +71,7 @@ type Config struct {
 	Writers        int
 	Generators     int
 	RF             int
+	Tablets        int
+	DropExisting   bool
 	ResyncInterval time.Duration
 }

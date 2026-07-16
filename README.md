@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS retailer_products (
 ) WITH tablets=4;
 ```
 
+The tablet presplit count is configurable via `-tablets`, and the table can be
+dropped and recreated with `-drop-existing`.
+
 ## Capabilities
 
 - **Realistic synthetic data.** Each row gets a JSONB `attributes` blob averaging
@@ -99,6 +102,8 @@ go build -o ycql-loader .
 | `-writers` | `32` | Number of writer goroutines (capped at the tablet count) |
 | `-generators` | `4` | Number of generator goroutines |
 | `-rf` | `1` | Replication factor used when creating the keyspace |
+| `-tablets` | `4` | Number of tablets to presplit `retailer_products` into when creating it (`<=0` uses the cluster default) |
+| `-drop-existing` | `false` | Drop the `retailer_products` table (if present) before creating it |
 | `-resync-interval` | `0` | How often to re-query `system.partitions` and realign writers (e.g. `30s`); `0` disables it |
 
 ### Examples
@@ -123,6 +128,12 @@ Load into a multi-node cluster with credentials and higher concurrency:
   -generators 8
 ```
 
+Start fresh by dropping any existing table and presplitting into 24 tablets:
+
+```bash
+./ycql-loader -drop-existing -tablets 24
+```
+
 Enable dynamic tablet resync, checking for tablet splits every 30 seconds:
 
 ```bash
@@ -138,7 +149,8 @@ generators ──▶ genOut channel ──▶ coordinator ──▶ per-writer c
                                     poller (every -resync-interval)
 ```
 
-1. The keyspace, UDT, and table are created if needed.
+1. The keyspace, UDT, and table are created if needed (optionally dropping an
+   existing table first, and presplitting into a configurable number of tablets).
 2. Tablets and their hash ranges are discovered from `system.partitions`.
 3. Generators produce partition-coherent batches, each tagged with its stable
    partition hash.
@@ -151,5 +163,7 @@ generators ──▶ genOut channel ──▶ coordinator ──▶ per-writer c
 
 - Tablet-aware routing is a locality optimization; correctness of inserts never
   depends on it, since each write carries its full partition key.
-- The table is created presplit with `WITH tablets=4`; adjust as needed for your
-  cluster sizing or to exercise the resync path alongside a lower split threshold.
+- The table is created presplit into `-tablets` tablets (default 4); adjust as
+  needed for your cluster sizing or to exercise the resync path alongside a lower
+  split threshold. Use `-drop-existing` to recreate the table from scratch (for
+  example when changing the tablet count of an existing table).
