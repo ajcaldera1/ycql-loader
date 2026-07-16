@@ -223,6 +223,23 @@ func (tm TabletMap) Count() int {
 	return len(tm.Tablets)
 }
 
+// SameAs reports whether two tablet maps describe the same hash-range layout.
+// It compares tablet count and each tablet's [StartHash, EndHash) boundaries,
+// ignoring tablet IDs and replica placement (which can churn without changing
+// how partitions map to hash ranges).
+func (tm TabletMap) SameAs(other TabletMap) bool {
+	if len(tm.Tablets) != len(other.Tablets) {
+		return false
+	}
+	for i := range tm.Tablets {
+		if tm.Tablets[i].StartHash != other.Tablets[i].StartHash ||
+			tm.Tablets[i].EndHash != other.Tablets[i].EndHash {
+			return false
+		}
+	}
+	return true
+}
+
 // Lookup returns the index of the tablet that owns the given partition hash.
 func (tm TabletMap) Lookup(hash uint16) int {
 	h := int64(hash)

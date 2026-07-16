@@ -128,10 +128,10 @@ func makePartitionRows(rng *rand.Rand, retailerID int, productID int64, combos [
 
 // StartGenerators launches n goroutines that collectively produce totalRows
 // worth of PartitionBatch items on the returned channel. Each batch contains
-// up to batchSize rows, all sharing one partition key. Each batch is tagged
-// with the index of the tablet that owns its partition, computed from the
-// client-side partition hash.
-func StartGenerators(n, totalRows, batchSize int, tabletMap TabletMap) <-chan PartitionBatch {
+// up to batchSize rows, all sharing one partition key, and is tagged with the
+// stable 16-bit partition hash of that key. Routing the batch to a tablet is
+// left to the coordinator, which owns the current tablet map.
+func StartGenerators(n, totalRows, batchSize int) <-chan PartitionBatch {
 	ch := make(chan PartitionBatch, n*4)
 
 	rowsPerGen := totalRows / n
@@ -153,9 +153,8 @@ func StartGenerators(n, totalRows, batchSize int, tabletMap TabletMap) <-chan Pa
 				retailerID := rng.Intn(numRetailers) + 1
 				productID := rng.Int63n(1_000_000_000_000) + 1
 
-				// Determine which tablet owns this partition key.
+				// Stable partition hash; the coordinator maps it to a tablet.
 				hash := PartitionHash(retailerID, productID)
-				tabletIdx := tabletMap.Lookup(hash)
 
 				remaining := quota - emitted
 				nCombos := CombosPerPartition
@@ -173,13 +172,13 @@ func StartGenerators(n, totalRows, batchSize int, tabletMap TabletMap) <-chan Pa
 
 				rows := makePartitionRows(rng, retailerID, productID, combos)
 
-				// Slice into batches of batchSize, all same partition/tablet
+				// Slice into batches of batchSize, all same partition
 				for j := 0; j < len(rows); j += batchSize {
 					end := j + batchSize
 					if end > len(rows) {
 						end = len(rows)
 					}
-					ch <- PartitionBatch{TabletIdx: tabletIdx, Rows: rows[j:end]}
+					ch <- PartitionBatch{Hash: hash, Rows: rows[j:end]}
 				}
 				emitted += len(rows)
 			}

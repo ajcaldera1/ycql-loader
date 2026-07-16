@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -24,53 +25,39 @@ func EffectiveWriters(configured, tabletCount int) int {
 	return configured
 }
 
-// StartWriters wires up tablet-aware routing and blocks until every batch from
+// RunCoordinator owns all mutable routing topology (the current tablet map, the
+// writer channels, and the writer goroutines) and blocks until every batch from
 // the generator channel has been written.
 //
-// Design: there is one input channel per writer. Each batch is routed to a
-// writer by mapping its tablet index onto a writer (tabletIdx % numWriters),
-// so all batches for a given tablet always land on the same writer and no
-// tablet is ever split across writers. When numWriters == tabletCount this is
-// exactly one writer per tablet; when there are more tablets than writers the
-// tablets are distributed round-robin, each writer owning a fixed subset. Each
-// writer drains exactly one channel, which avoids the deadlock that draining
-// multiple still-open channels sequentially would cause.
-func StartWriters(
-	configuredWriters int,
+// Design: a single goroutine (this function) is the sole owner of the topology,
+// so reconfiguration needs no locks. It runs one select loop over incoming
+// batches and new tablet maps from the poller. Each batch carries a stable
+// partition hash; the coordinator looks it up against the current tablet map and
+// routes it to a writer via tabletIdx % numWriters, so all batches for a tablet
+// land on the same writer and no tablet is split across writers.
+//
+// When a resync reports more tablets, the writer pool grows (up to the
+// configured max); when it reports fewer, the pool shrinks. Because every batch
+// still carries its real partition key, YugabyteDB routes each insert correctly
+// regardless of which writer sends it, so a stale route during the brief
+// reconfiguration window costs only locality, never correctness.
+func RunCoordinator(
+	ctx context.Context,
 	session *gocql.Session,
-	batches <-chan PartitionBatch,
-	tabletCount int,
+	genOut <-chan PartitionBatch,
+	newMapCh <-chan TabletMap,
+	initial TabletMap,
+	cfg Config,
 	totalRows int,
-	startTime time.Time,
+	start time.Time,
 ) {
-	numWriters := EffectiveWriters(configuredWriters, tabletCount)
-	if numWriters < 1 {
-		numWriters = 1
-	}
-
-	// One buffered channel per writer.
-	writerChans := make([]chan PartitionBatch, numWriters)
-	for i := range writerChans {
-		writerChans[i] = make(chan PartitionBatch, 16)
-	}
-
-	// Router: fan the generator output out to per-writer channels based on the
-	// owning tablet, then close all writer channels once generation is done.
-	go func() {
-		for pb := range batches {
-			writerChans[pb.TabletIdx%numWriters] <- pb
-		}
-		for i := range writerChans {
-			close(writerChans[i])
-		}
-	}()
-
 	var written atomic.Int64
 	var wg sync.WaitGroup
 
-	for w := 0; w < numWriters; w++ {
+	// A writer drains exactly one channel, writing each batch to YCQL.
+	startWriter := func(in <-chan PartitionBatch) {
 		wg.Add(1)
-		go func(in <-chan PartitionBatch) {
+		go func() {
 			defer wg.Done()
 			for pb := range in {
 				if err := writeBatch(session, pb); err != nil {
@@ -78,11 +65,78 @@ func StartWriters(
 					continue
 				}
 				done := written.Add(int64(len(pb.Rows)))
-				reportProgress(done, int64(totalRows), startTime)
+				reportProgress(done, int64(totalRows), start)
 			}
-		}(writerChans[w])
+		}()
 	}
 
+	cur := initial
+	numWriters := EffectiveWriters(cfg.Writers, cur.Count())
+	if numWriters < 1 {
+		numWriters = 1
+	}
+
+	writerChans := make([]chan PartitionBatch, numWriters)
+	for i := range writerChans {
+		writerChans[i] = make(chan PartitionBatch, 16)
+		startWriter(writerChans[i])
+	}
+
+	// reconfigure realigns the writer pool onto a new tablet layout.
+	reconfigure := func(nm TabletMap) {
+		if nm.Count() == 0 {
+			return
+		}
+		oldTablets := cur.Count()
+		oldNum := numWriters
+
+		newNum := EffectiveWriters(cfg.Writers, nm.Count())
+		if newNum < 1 {
+			newNum = 1
+		}
+
+		switch {
+		case newNum > oldNum:
+			for i := oldNum; i < newNum; i++ {
+				ch := make(chan PartitionBatch, 16)
+				writerChans = append(writerChans, ch)
+				startWriter(ch)
+			}
+		case newNum < oldNum:
+			for i := newNum; i < oldNum; i++ {
+				close(writerChans[i])
+			}
+			writerChans = writerChans[:newNum]
+		}
+
+		cur = nm
+		numWriters = newNum
+
+		fmt.Printf("  [resync] tablets %d -> %d, writers %d -> %d\n",
+			oldTablets, nm.Count(), oldNum, newNum)
+	}
+
+loop:
+	for {
+		select {
+		case pb, ok := <-genOut:
+			if !ok {
+				break loop
+			}
+			w := cur.Lookup(pb.Hash) % numWriters
+			writerChans[w] <- pb
+		case nm := <-newMapCh:
+			reconfigure(nm)
+		case <-ctx.Done():
+			break loop
+		}
+	}
+
+	// Generation finished (or shutdown requested): close all writer channels
+	// and wait for in-flight writes to drain.
+	for i := range writerChans {
+		close(writerChans[i])
+	}
 	wg.Wait()
 }
 

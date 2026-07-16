@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -52,6 +53,8 @@ func main() {
 	flag.IntVar(&cfg.Writers, "writers", 32, "Number of writer goroutines")
 	flag.IntVar(&cfg.Generators, "generators", 4, "Number of generator goroutines")
 	flag.IntVar(&cfg.RF, "rf", 1, "Replication factor for keyspace creation")
+	flag.DurationVar(&cfg.ResyncInterval, "resync-interval", 0,
+		"How often to re-query system.partitions and realign writers to new tablet boundaries (e.g. 30s; 0 = disabled)")
 	flag.Parse()
 
 	hosts := parseHosts(cfg.Hosts)
@@ -85,7 +88,19 @@ func main() {
 	fmt.Printf("Discovered %d tablet(s) for retailer_products:\n", tabletCount)
 	printTabletRanges(tabletMap)
 
-	// Phase 4: generate + write
+	// Phase 4: start the resync poller (no-op when interval is 0) so writers
+	// realign as tablets split during the load.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	newMapCh := make(chan TabletMap, 1)
+	go StartPoller(ctx, session, cfg.Keyspace, "retailer_products", cfg.ResyncInterval, tabletMap, newMapCh)
+
+	resyncDesc := "disabled"
+	if cfg.ResyncInterval > 0 {
+		resyncDesc = cfg.ResyncInterval.String()
+	}
+
+	// Phase 5: generate + write
 	approxMB := cfg.TotalRows * 12 / 1024
 	approxPartitions := cfg.TotalRows / CombosPerPartition
 	fmt.Printf("Inserting %d rows  |  generators=%d  |  writers=%d (of %d configured)  |  batch_size=%d\n",
@@ -93,12 +108,16 @@ func main() {
 	fmt.Printf("Estimated data volume: ~%d MB  |  ~%d partitions  |  %d tablets\n",
 		approxMB, approxPartitions, tabletCount)
 	fmt.Printf("Tablet-aware routing: each batch is sent to the writer owning its tablet\n")
+	fmt.Printf("Tablet resync: %s\n", resyncDesc)
 	fmt.Println(strings.Repeat("-", 74))
 
 	start := time.Now()
 
-	batches := StartGenerators(cfg.Generators, cfg.TotalRows, cfg.BatchSize, tabletMap)
-	StartWriters(cfg.Writers, session, batches, tabletCount, cfg.TotalRows, start)
+	batches := StartGenerators(cfg.Generators, cfg.TotalRows, cfg.BatchSize)
+	RunCoordinator(ctx, session, batches, newMapCh, tabletMap, cfg, cfg.TotalRows, start)
+
+	// Generation and writes are done; stop the poller.
+	cancel()
 
 	elapsed := time.Since(start).Seconds()
 	rate := float64(cfg.TotalRows) / elapsed

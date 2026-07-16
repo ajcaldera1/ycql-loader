@@ -27,11 +27,12 @@ type Row struct {
 
 // PartitionBatch is a group of rows that share the same partition key
 // (retailer_id, product_id) and can be sent in a single UNLOGGED BATCH
-// to one tablet. TabletIdx identifies which tablet owns the partition, so the
-// router can dispatch the batch to the writer assigned to that tablet.
+// to one tablet. Hash is the 16-bit partition hash of the partition key; it is
+// stable regardless of how tablets are currently split, so the coordinator can
+// route the batch by looking the hash up against the current tablet map.
 type PartitionBatch struct {
-	TabletIdx int
-	Rows      []Row
+	Hash uint16
+	Rows []Row
 }
 
 // ClusteringCombo holds one combination of clustering column values.
@@ -60,14 +61,15 @@ const CombosPerPartition = 30
 
 // Config holds all runtime configuration.
 type Config struct {
-	Hosts       string
-	Port        int
-	Keyspace    string
-	Username    string
-	Password    string
-	TotalRows   int
-	BatchSize   int
-	Writers     int
-	Generators  int
-	RF          int
+	Hosts          string
+	Port           int
+	Keyspace       string
+	Username       string
+	Password       string
+	TotalRows      int
+	BatchSize      int
+	Writers        int
+	Generators     int
+	RF             int
+	ResyncInterval time.Duration
 }
