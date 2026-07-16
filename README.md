@@ -43,7 +43,7 @@ dropped and recreated with `-drop-existing`.
   drawn from a pre-generated word pool for speed.
 - **Partition-coherent batching.** Rows are produced one partition key at a time
   (all 30 clustering combinations of a `(retailer_id, product_id)` partition), and
-  each `UNLOGGED` batch contains only rows from a single partition so it maps to
+  each batch contains only rows from a single partition so it maps to
   one tablet.
 - **Client-side tablet routing.** The partition hash is computed client-side with
   the exact algorithm used by the `yugabyte/gocql` driver (Jenkins hash, seed 97,
@@ -101,7 +101,6 @@ go build -o ycql-loader .
 | `-batch-size` | `10` | Rows per `UNLOGGED` batch (all from one partition) |
 | `-writers` | `32` | Number of writer goroutines (capped at the tablet count) |
 | `-generators` | `4` | Number of generator goroutines |
-| `-rf` | `1` | Replication factor used when creating the keyspace |
 | `-tablets` | `4` | Number of tablets to presplit `retailer_products` into when creating it (`<=0` uses the cluster default) |
 | `-drop-existing` | `false` | Drop the `retailer_products` table (if present) before creating it |
 | `-resync-interval` | `0` | How often to re-query `system.partitions` and realign writers (e.g. `30s`); `0` disables it |
@@ -122,7 +121,6 @@ Load into a multi-node cluster with credentials and higher concurrency:
   -username cassandra \
   -password secret \
   -keyspace demo \
-  -rf 3 \
   -rows 5000000 \
   -writers 64 \
   -generators 8
